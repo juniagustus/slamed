@@ -1,0 +1,240 @@
+name: Build Spes Kernel
+on:
+  workflow_dispatch:
+    inputs:
+      KERNEL_REPO:
+        description: "KERNEL_REPO"
+        required: true
+        type: string
+        default: mi-sdm680/android_kernel_xiaomi_sm6225
+      KERNEL_BRANCH:
+        description: "KERNEL_BRANCH"
+        required: true
+        type: string
+        default: spes-r-oss
+      KERNEL_NAME:
+        description: "KERNEL_NAME"
+        required: true
+        type: string
+        default: Mi680-spes-KSU
+      DEFCONFIG:
+        description: "DEFCONFIG"
+        required: true
+        type: string
+        default: vendor/spes-perf_defconfig
+      CLANG_VERSION:
+        description: "CLANG_VERSION"
+        required: true
+        type: number
+        default: 14
+      KSU:
+        description: "KSU"
+        required: false
+        type: boolean
+        default: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set Time Zone
+        uses: szenius/set-timezone@v1.2
+        with:
+          timezoneLinux: "Asia/Jakarta"
+      - name: Set Swap Space
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 10
+      - name: SetUp req
+        run: |
+          ###
+          sudo apt-get update
+          sudo apt-get install git make bc bison openssl curl zip kmod cpio flex libelf-dev \
+          libssl-dev libtfm-dev wget device-tree-compiler ca-certificates python3 python2 xz-utils libgcc-10-dev
+          sudo ln -sf /usr/bin/python3 /usr/bin/python
+      - name: Checkout ${{ github.event.inputs.KERNEL_REPO }}-${{ github.event.inputs.KERNEL_BRANCH }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.KERNEL_REPO }}
+          ref: ${{ github.event.inputs.KERNEL_BRANCH }}
+          path: source
+      - name: Naming
+        id: naming
+        run: |
+          ###
+          echo "BUILD_TIME=$(date "+%Y%m%d%H%M")" >> $GITHUB_OUTPUT
+          cd source
+          echo "CURRENT_COMMIT=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          SOURCE=$(realpath .)
+          echo "SOURCE=$SOURCE" >> $GITHUB_OUTPUT
+          CONFIGS="${SOURCE}/arch/arm64/configs"
+          file_defconfig="${CONFIGS}/${{ github.event.inputs.DEFCONFIG }}"
+          echo "FILE_DEFCONFIG=$file_defconfig" >> $GITHUB_OUTPUT
+          ###
+          sed -i "s/CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"-${{ github.event.inputs.KERNEL_NAME }}\"/g" $file_defconfig
+      - name: Integrated KernelSU
+        if: ${{ github.event.inputs.KSU == 'true' }}
+        run: |
+          ###
+          cd "${{ steps.naming.outputs.SOURCE }}"
+          file_defconfig=${{ steps.naming.outputs.FILE_DEFCONFIG }}
+          echo "[+] Append kernel params to kprobes"
+          echo "CONFIG_KPROBES=y" >> $file_defconfig
+          echo "CONFIG_HAVE_KPROBES=y" >> $file_defconfig
+          echo "CONFIG_KPROBE_EVENTS=y" >> $file_defconfig
+          ###
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
+      - name: Checkout clang
+        id: clang
+        run: |
+          ###
+          git clone --depth 1 https://gitlab.com/ThankYouMario/android_prebuilts_clang-standalone.git \
+          --branch ${{ github.event.inputs.CLANG_VERSION }} --single-branch clang
+          echo "CLANG_PATH=$(pwd)/clang" >> $GITHUB_OUTPUT
+      - name: Check if there are any changes
+        id: verify_diff
+        run: |
+          cd ${{ steps.naming.outputs.SOURCE }}
+          git diff --quiet . || echo "changed=true" >> $GITHUB_OUTPUT
+      - name: Commit change
+        if: steps.verify_diff.outputs.changed == 'true'
+        run: |
+          cd ${{ steps.naming.outputs.SOURCE }}
+          ###
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+          git add .
+          git commit -m "getting rid of -dirty"
+      - name: Android kernel build
+        id: build
+        run: |
+          ###
+          cd "${{ steps.naming.outputs.SOURCE }}"
+          export KBUILD_BUILD_USER="ratabb"
+          export KBUILD_BUILD_HOST="github.com"
+          export PATH="${{ steps.clang.outputs.CLANG_PATH }}/bin:$PATH"
+          arch=arm64
+          arch_opts="ARCH=${arch} SUBARCH=${arch}"
+          export ARCH="$arch"
+          export SUBARCH="$arch"
+          ###
+          make_opts="CC=clang LD=ld.lld NM=llvm-nm AR=llvm-ar STRIP=llvm-strip OBJCOPY=llvm-objcopy"
+          make_opts+=" OBJDUMP=llvm-objdump READELF=llvm-readelf LLVM_IAS=1"
+          host_make_opts="HOSTCC=clang HOSTCXX=clang++ HOSTLD=ld.lld HOSTAR=llvm-ar"
+          export CLANG_TRIPLE="aarch64-linux-gnu-"
+          export CROSS_COMPILE="aarch64-linux-gnu-"
+          export CROSS_COMPILE_ARM32="arm-linux-gnueabi-"
+          ###
+          defconfig=${{ github.event.inputs.DEFCONFIG }}
+          start_time="$(date +%s)"
+          echo "[+] Generating defconfig from \`make $defconfig\`..."
+          if ! make O=out $arch_opts $make_opts $host_make_opts "$defconfig"; then
+          echo "[!] Failed generating .config, make sure it is actually available in arch/${arch}/configs/ and is a valid defconfig file"
+          exit 2
+          fi
+          ###
+          echo "[+] Begin building kernel..."
+          make O=out $arch_opts $make_opts $host_make_opts -j"$(nproc --all)" prepare
+          if ! make O=out $arch_opts $make_opts $host_make_opts -j"$(nproc --all)"; then
+          echo "[!] Failed building kernel, probably the toolchain is not compatible with the kernel, or kernel source problem"
+          exit 3
+          fi
+          elapsed="$(echo "$(date +%s)"-"$start_time" | bc)"
+          elapsed_time=$(date -d@$elapsed -u '+%H:%M:%S')
+          echo "[+] Done building kernel, took $elapsed_time"
+          echo "elapsed_time=$elapsed_time" >> $GITHUB_OUTPUT
+          echo "image_gz=$(pwd)/out/arch/arm64/boot/Image.gz" >> $GITHUB_OUTPUT
+          echo "dtbo_img=$(pwd)/out/arch/arm64/boot/dtbo.img" >> $GITHUB_OUTPUT
+          ###
+      - name: Checkout AnyKernel3
+        uses: actions/checkout@v4
+        with:
+          repository: osm0sis/AnyKernel3
+          path: AnyKernel3
+      - name: Packing with AnyKernel3
+        id: pack
+        run: |
+          ###
+          cd AnyKernel3
+          echo '[+] Write anykernel.sh'
+          cat > anykernel.sh <<EOF
+          ### AnyKernel3 Ramdisk Mod Script
+          ## osm0sis @ xda-developers
+          #
+          ### AnyKernel setup
+          # begin properties
+          properties() { '
+          kernel.string=${{ github.event.inputs.KERNEL_NAME }}
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=spes
+          device.name2=spesn
+          supported.versions=
+          supported.patchlevels=
+          '; } # end properties
+          #
+          ### AnyKernel install
+          #
+          ## boot shell variables
+          block=boot;
+          is_slot_device=1;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+          #
+          # import functions/variables and setup patching - see for reference (DO NOT REMOVE)
+          . tools/ak3-core.sh;
+          ui_print "===[ ${{ steps.naming.outputs.BUILD_TIME }} ]===";
+          # boot install
+          dump_boot;
+          write_boot;
+          # end boot install
+          ui_print "===[ $(date) ]===";
+          ui_print "Kernel source"
+          ui_print " - Repo ${{ github.event.inputs.KERNEL_REPO }}"
+          ui_print " - Branch ${{ github.event.inputs.KERNEL_BRANCH }}"
+          ui_print " - Hash-commit ${{ steps.naming.outputs.CURRENT_COMMIT }}"
+          ui_print "===[ *** ]===";
+          EOF
+          ###
+          echo '[+] Copy Image.gz and dtbo.img'
+          cp "${{ steps.build.outputs.image_gz }}" ./
+          cp "${{ steps.build.outputs.dtbo_img }}" ./
+          zip_filename="${{ github.event.inputs.KERNEL_NAME }}-${{ steps.naming.outputs.BUILD_TIME }}.zip"
+          echo "[+] Zip AnyKernel3: $zip_filename"
+          rm -rf .git*
+          zip -r9 "$zip_filename" . -x .gitignore README.md
+          SHA=$(cat $zip_filename 2>/dev/null | sha256sum | cut -d ' ' -f1)
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+
+          OUTFILE=$(realpath "$zip_filename")
+          echo "outfile=$OUTFILE" >> $GITHUB_OUTPUT
+          echo "[+] Done, outfile: $OUTFILE"
+      - name: Upload to Pixeldrain
+        id: upload
+        run: |
+          ###
+          PDSERVER="https://pixeldrain.com"
+          FILE=${{ steps.pack.outputs.outfile }}
+          FILENAME=$(basename $FILE)
+          echo "[+] Uploading $FILENAME to Pixeldrain"
+          RESPONSE=$(curl -# -F "name=$FILENAME" -F "file=@$FILE" $PDSERVER/api/file)
+          FILEID=$(echo $RESPONSE | grep -Po '(?<="id":")[^"]*' )
+          URL="$PDSERVER/api/file/$FILEID"
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "[+] Done, your file url is $URL"
+      - name: SendTo Telegram
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_TO }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          message: |
+            Kernel ${{ github.event.inputs.KERNEL_NAME }}-${{ steps.naming.outputs.BUILD_TIME }} is built!, took ${{ steps.build.outputs.elapsed_time }}.
+
+            Commit https://www.github.com/${{ github.event.inputs.KERNEL_REPO }}/commit/${{ steps.naming.outputs.CURRENT_COMMIT }}
+
+            Url ${{ steps.upload.outputs.url }}
+
+            SHA Checksum ${{ steps.pack.outputs.sha }}
+          document: ${{ steps.pack.outputs.outfile }}
